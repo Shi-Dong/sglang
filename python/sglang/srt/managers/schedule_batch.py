@@ -132,6 +132,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1090,6 +1091,9 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        # Keep sampling-time routes separate from the final/streamed payload.
+        # Re-prefill may overwrite the host capture buffer with different routes.
+        self._routed_experts_before_retract: Optional[torch.Tensor] = None
 
         self.return_indexer_topk = return_indexer_topk
         self.indexer_topk: Optional[torch.Tensor] = (
@@ -1671,6 +1675,34 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
+    def collect_routed_experts(
+        self, req_to_token_pool: ReqToTokenPool
+    ) -> Optional[torch.Tensor]:
+        """Join preserved sampling-time routes with newly generated positions."""
+        if not self.return_routed_experts:
+            return None
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            return None
+
+        start_len = self.routed_experts_start_len
+        seqlen = len(self.origin_input_ids) + len(self.output_ids_through_stop)
+        expected_rows = max(0, seqlen - 1 - start_len)
+        saved = self._routed_experts_before_retract
+        saved_rows = 0 if saved is None else saved.shape[0]
+        if saved is not None and saved_rows >= expected_rows:
+            # A repeated retract may interrupt re-prefill before the preserved
+            # prefix has been recomputed. Do not read those uninitialized slots.
+            return saved[:expected_rows]
+
+        new_routes = capturer.get_topk(
+            req_pool_idx=self.req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=req_to_token_pool,
+            start_len=start_len + saved_rows,
+        )
+        return new_routes if saved is None else torch.cat((saved, new_routes))
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
@@ -1716,6 +1748,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self._routed_experts_before_retract = None
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
@@ -1924,6 +1957,13 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> None:
+    if req.return_routed_experts and req.output_ids and req.input_embeds is None:
+        # Gather an owned CPU snapshot before freeing/reusing the KV pool slots.
+        # Generated tokens and their logprobs survive retract; their routes must
+        # survive too, even if recomputation uses different weights or batches.
+        req._routed_experts_before_retract = req.collect_routed_experts(
+            req_to_token_pool
+        )
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
